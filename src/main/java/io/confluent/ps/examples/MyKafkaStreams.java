@@ -13,11 +13,9 @@ import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.state.WindowStore;
-import org.apache.kafka.streams.state.WindowStoreIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.time.Duration;
 import java.util.Properties;
 
@@ -28,7 +26,7 @@ public class MyKafkaStreams {
 
   public static final String STATE_STORE_NAME = "state-store";
 
-  private static Properties createConfig() throws IOException {
+  private static Properties createConfig() {
     Properties props = new Properties();
     props.put(StreamsConfig.APPLICATION_ID_CONFIG, "kafka-streams-pruner-example");
     props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
@@ -38,13 +36,13 @@ public class MyKafkaStreams {
     return props;
   }
 
-  public static void main(final String[] args) throws Exception {
+  public static void main(final String[] args) {
     log.info("Starting...");
 
     StreamsBuilder builder = new StreamsBuilder();
 
-    // `retainDuplicates` is for stream-to-stream joins, so set this to `false`
-    // because this example is not doing a join.
+    // `retainDuplicates` must be false so when the same key and timestamp are used to update a value,
+    //  only one value will be stored.
     //
     // `retentionPeriod` must be slightly larger than `windowSize`. Because this example is only
     // using a WindowStore to expire old keys, the `retentionPeriod` and `windowSize` can be roughly
@@ -82,39 +80,39 @@ public class MyKafkaStreams {
      * The overall flow to use a WindowStore in this way is as follows:
      *  - to get, simply fetch the first value for a given key
      *  - to put a new key/value pair, use put and make the `windowStartTimestamp` the current wall clock time.
-     *  - to put an existing key/value pair, first delete the existing value, then put a new value but maintain
-     *    the existing windowStartTimestamp to ensure the key is expired at the correct time.
+     *  - to put an existing key/value pair, first fetch the existing windowStartTime, then put a new value but maintain
+     *    the existing windowStartTimestamp to ensure the key is expired at the correct time and to ensure the
+     *    existing value is overwritten.
      */
     @Override
     public KeyValue<String, String> transform(String key, String value) {
       log.info("TRANSFORM key: '" + key + "', value: '" + value + "'");
 
-      // this shows how to get the existing value for a given key.
-      String stateStoreValue = getValue(this.stateStore, key);
-      log.info("FETCH key: '" + key + "', value: '" + stateStoreValue + "'");
+      // get the value and the window timestamp from the state store.
+      KeyValue<Windowed<String>, String> windowedKeyValue = getWindowedKeyValue(this.stateStore, key);
+      String storeValue = null;
+      Long storeTimestamp = null;
+
+      if (windowedKeyValue != null) {
+        storeValue = windowedKeyValue.value;
+        storeTimestamp = windowedKeyValue.key.window().start();
+      }
+
+      log.info("FETCH key: '" + key + "', value: '" + storeValue + "', timestamp: " + storeTimestamp);
       dumpKey(this.stateStore, key);
 
-      Long timestampForKey = getTimestampForKey(this.stateStore, key);
-      if (timestampForKey != null) {
-        // delete the old value from the state store. Otherwise, the windowed state store will have
-        // multiple values for a given key.
-        // do this whenever updating a key's value for a key that already exists.
-        // notice that `put` is used with a `null` value -- this behaves as a delete.
-        this.stateStore.put(key, null, timestampForKey);
-        log.info("Deleted key '" + key + "' and timestamp: " + timestampForKey);
-        dumpKey(this.stateStore, key);
-      } else {
-        // because the key doesn't exist in the store yet, set the timestamp
-        // to be the current wall clock time.
-        timestampForKey = System.currentTimeMillis();
+      // because the key doesn't exist in the store yet, set the timestamp
+      // to be the current wall clock time.
+      if (storeTimestamp == null) {
+        storeTimestamp = System.currentTimeMillis();
       }
 
       // this shows how to put a value into the state store.
       // the `windowStartTimestamp` should be equal to the previous value's window time so
       // the key will be expired when intended. If the current wall clock time is used instead,
       // the key will survive longer than intended.
-      this.stateStore.put(key, value, timestampForKey);
-      log.info("PUT key: '" + key + "', value: " + value + "'");
+      this.stateStore.put(key, value, storeTimestamp);
+      log.info("PUT key: '" + key + "', value: " + value + "', timestamp: " + storeTimestamp);
       dumpKey(this.stateStore, key);
 
       // do nothing to the actual message, because in this example I'm only showing how to interact with the state store.
@@ -126,26 +124,13 @@ public class MyKafkaStreams {
 
     }
 
-    private static String getValue(WindowStore<String, String> store, String key) {
-      WindowStoreIterator<String> iterator = store.fetch(key, 0, System.currentTimeMillis());
-
-      String valueToReturn = null;
-      if (iterator.hasNext()) {
-        valueToReturn = iterator.next().value;
-      }
-
-      iterator.close();
-      return valueToReturn;
-    }
-
-    private static Long getTimestampForKey(WindowStore<String, String> store, String key) {
+    private static KeyValue<Windowed<String>, String> getWindowedKeyValue(WindowStore<String, String> store, String key) {
       // need to this particular `fetch` API to get the window timestamp.
       KeyValueIterator<Windowed<String>, String> iterator = store.fetch(key, key, 0, System.currentTimeMillis());
 
-      Long toReturn = null;
+      KeyValue<Windowed<String>, String> toReturn = null;
       if (iterator.hasNext()) {
-        KeyValue<Windowed<String>, String> windowedKey = iterator.next();
-        toReturn = windowedKey.key.window().start();
+        toReturn = iterator.next();
       }
 
       iterator.close();
